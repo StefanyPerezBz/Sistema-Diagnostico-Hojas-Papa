@@ -24,8 +24,10 @@ import tensorflow as tf
 from scipy import stats
 import time
 import base64
+import warnings
 
-# Configuración de la página
+# Configuration
+warnings.filterwarnings('ignore')
 st.set_page_config(
     page_title="Diagnóstico de Enfermedades en Papas",
     page_icon="🥔",
@@ -33,7 +35,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Título principal
+# Title
 st.title("🥔 Potato Disease Classifier")
 st.markdown("""
 Sistema de clasificación de enfermedades en hojas de papa usando Deep Learning.
@@ -53,7 +55,7 @@ with st.sidebar:
     batch_size = st.selectbox("Batch size", [16, 32, 64, 128], index=1)
     learning_rate = st.number_input("Learning rate", 0.00001, 0.01, 0.001, format="%.5f")
 
-    # Modelos disponibles
+    # Available models
     MODELS = {
         "EfficientNetB0": EfficientNetB0,
         "ResNet50V2": ResNet50V2,
@@ -62,28 +64,63 @@ with st.sidebar:
     }
     selected_models = st.multiselect("Modelos", list(MODELS.keys()), default=["EfficientNetB0"])
 
-    # Opciones avanzadas
+    # Advanced options
     with st.expander("Opciones avanzadas"):
         use_augmentation = st.checkbox("Data augmentation", True)
         use_early_stopping = st.checkbox("Early stopping", True)
+        cache_models = st.checkbox("Cache models", True, help="Guarda modelos para evitar volver a descargar")
 
-# Cargar datos
-@st.cache_data
+# Load data with better error handling
+@st.cache_data(show_spinner=False)
 def load_data(dataset_path):
     try:
+        if not os.path.exists(dataset_path):
+            st.error(f"Dataset path not found: {dataset_path}")
+            return None, None, None, None, None
+
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        status_text.text("Cargando dataset...")
+
         classes = sorted(os.listdir(dataset_path))
+        if not classes:
+            st.error("No se encontraron clases en el directorio del dataset")
+            return None, None, None, None, None
+
         images = []
         labels = []
+        class_counts = {class_name: 0 for class_name in classes}
+
+        total_images = sum([len(files) for r, d, files in os.walk(dataset_path)])
+        processed_images = 0
 
         for class_idx, class_name in enumerate(classes):
             class_path = os.path.join(dataset_path, class_name)
-            for img_file in os.listdir(class_path)[:500]:  # Limitar para demo
-                img_path = os.path.join(class_path, img_file)
-                img = cv2.imread(img_path)
-                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                img = cv2.resize(img, (224, 224))
-                images.append(img)
-                labels.append(class_idx)
+            image_files = [f for f in os.listdir(class_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))][:500]
+
+            for img_file in image_files:
+                try:
+                    img_path = os.path.join(class_path, img_file)
+                    img = cv2.imread(img_path)
+                    if img is None:
+                        continue
+
+                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    img = cv2.resize(img, (224, 224))
+                    images.append(img)
+                    labels.append(class_idx)
+                    class_counts[class_name] += 1
+
+                    processed_images += 1
+                    progress_bar.progress(processed_images / min(500 * len(classes), total_images))
+                    
+                except Exception as e:
+                    st.warning(f"Error procesando {img_file}: {str(e)}")
+                    continue
+
+        if not images:
+            st.error("No se pudieron cargar imágenes válidas")
+            return None, None, None, None, None
 
         X = np.array(images, dtype='float32')
         y = np.array(labels)
@@ -92,7 +129,7 @@ def load_data(dataset_path):
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=test_size/100, random_state=42, stratify=y)
 
-        # Normalizar
+        # Normalize
         X_train = X_train / 255.0
         X_test = X_test / 255.0
 
@@ -100,41 +137,51 @@ def load_data(dataset_path):
         y_train = to_categorical(y_train, len(classes))
         y_test = to_categorical(y_test, len(classes))
 
+        status_text.text("✅ Dataset cargado exitosamente!")
+        time.sleep(1)
+        status_text.empty()
+        progress_bar.empty()
+
         return X_train, X_test, y_train, y_test, classes
 
     except Exception as e:
-        st.error(f"Error loading data: {str(e)}")
+        st.error(f"Error cargando datos: {str(e)}")
         return None, None, None, None, None
 
-# Función para crear modelo
-def create_model(base_model_name, num_classes, learning_rate):
-    base_model = MODELS[base_model_name](
-        include_top=False,
-        weights='imagenet',
-        input_shape=(224, 224, 3))
-    
-    base_model.trainable = False
+# Create model with caching
+@st.cache_resource(show_spinner=False)
+def create_cached_model(base_model_name, num_classes, learning_rate):
+    try:
+        base_model = MODELS[base_model_name](
+            include_top=False,
+            weights='imagenet',
+            input_shape=(224, 224, 3))
+        
+        base_model.trainable = False
 
-    inputs = tf.keras.Input(shape=(224, 224, 3))
-    x = base_model(inputs, training=False)
-    x = GlobalAveragePooling2D()(x)
-    x = BatchNormalization()(x)
-    x = Dropout(0.2)(x)
-    x = Dense(512, activation='relu')(x)
-    x = BatchNormalization()(x)
-    x = Dropout(0.3)(x)
-    outputs = Dense(num_classes, activation='softmax')(x)
+        inputs = tf.keras.Input(shape=(224, 224, 3))
+        x = base_model(inputs, training=False)
+        x = GlobalAveragePooling2D()(x)
+        x = BatchNormalization()(x)
+        x = Dropout(0.2)(x)
+        x = Dense(512, activation='relu')(x)
+        x = BatchNormalization()(x)
+        x = Dropout(0.3)(x)
+        outputs = Dense(num_classes, activation='softmax')(x)
 
-    model = Model(inputs, outputs)
-    model.compile(
-        optimizer=Adam(learning_rate=learning_rate),
-        loss='categorical_crossentropy',
-        metrics=['accuracy',
-                tf.keras.metrics.Precision(name='precision'),
-                tf.keras.metrics.Recall(name='recall')])
-    return model
+        model = Model(inputs, outputs)
+        model.compile(
+            optimizer=Adam(learning_rate=learning_rate),
+            loss='categorical_crossentropy',
+            metrics=['accuracy',
+                    tf.keras.metrics.Precision(name='precision'),
+                    tf.keras.metrics.Recall(name='recall')])
+        return model
+    except Exception as e:
+        st.error(f"Error creating {base_model_name}: {str(e)}")
+        return None
 
-# Entrenar modelos
+# Train models
 def train_models(X_train, X_test, y_train, y_test, classes):
     results = {}
     models = {}
@@ -149,20 +196,29 @@ def train_models(X_train, X_test, y_train, y_test, classes):
         status_text.text(f"Entrenando {model_name}...")
 
         try:
-            model = create_model(model_name, len(classes), learning_rate)
+            # Create or load cached model
+            if cache_models and os.path.exists(f"models/potato_{model_name}.h5"):
+                model = load_model(f"models/potato_{model_name}.h5")
+                status_text.text(f"Cargando modelo {model_name} desde caché...")
+            else:
+                model = create_cached_model(model_name, len(classes), learning_rate)
+                if model is None:
+                    continue
 
             callbacks = []
             if use_early_stopping:
                 callbacks.append(EarlyStopping(
                     monitor='val_loss',
                     patience=8,
+                    verbose=1,
                     restore_best_weights=True))
 
             callbacks.append(ReduceLROnPlateau(
                 monitor='val_loss',
                 factor=0.2,
                 patience=5,
-                min_lr=0.00001))
+                min_lr=0.00001,
+                verbose=1))
 
             # Data augmentation
             train_datagen = ImageDataGenerator(
@@ -175,29 +231,30 @@ def train_models(X_train, X_test, y_train, y_test, classes):
                 vertical_flip=True,
                 fill_mode='nearest') if use_augmentation else None
 
-            # Entrenamiento
-            if train_datagen:
-                history = model.fit(
-                    train_datagen.flow(X_train, y_train, batch_size=batch_size),
-                    epochs=epochs,
-                    validation_data=(X_test, y_test),
-                    callbacks=callbacks,
-                    verbose=0)
-            else:
-                history = model.fit(
-                    X_train, y_train,
-                    batch_size=batch_size,
-                    epochs=epochs,
-                    validation_data=(X_test, y_test),
-                    callbacks=callbacks,
-                    verbose=0)
+            # Training
+            with st.spinner(f"Entrenando {model_name}..."):
+                if train_datagen:
+                    history = model.fit(
+                        train_datagen.flow(X_train, y_train, batch_size=batch_size),
+                        epochs=epochs,
+                        validation_data=(X_test, y_test),
+                        callbacks=callbacks,
+                        verbose=0)
+                else:
+                    history = model.fit(
+                        X_train, y_train,
+                        batch_size=batch_size,
+                        epochs=epochs,
+                        validation_data=(X_test, y_test),
+                        callbacks=callbacks,
+                        verbose=0)
 
-            # Evaluación
-            y_pred = model.predict(X_test)
+            # Evaluation
+            y_pred = model.predict(X_test, verbose=0)
             y_pred_classes = np.argmax(y_pred, axis=1)
             y_test_classes = np.argmax(y_test, axis=1)
 
-            # Métricas
+            # Metrics
             results[model_name] = {
                 'accuracy': accuracy_score(y_test_classes, y_pred_classes),
                 'precision': precision_score(y_test_classes, y_pred_classes, average='weighted'),
@@ -212,7 +269,7 @@ def train_models(X_train, X_test, y_train, y_test, classes):
             histories[model_name] = history.history
             training_times[model_name] = time.time() - start_time
 
-            # Guardar modelo
+            # Save model
             os.makedirs('models', exist_ok=True)
             model_path = f"models/potato_{model_name}.h5"
             model.save(model_path)
@@ -226,56 +283,88 @@ def train_models(X_train, X_test, y_train, y_test, classes):
     status_text.text("✅ Entrenamiento completado!")
     time.sleep(1)
     status_text.empty()
+    progress_bar.empty()
 
     return results, models, histories, training_times
 
-# Generar reporte PDF
+# Generate PDF report
 def generate_report(results, classes, filename="reports/report.pdf"):
-    doc = SimpleDocTemplate(filename, pagesize=letter)
-    styles = getSampleStyleSheet()
-    story = []
+    try:
+        os.makedirs('reports', exist_ok=True)
+        
+        doc = SimpleDocTemplate(filename, pagesize=letter)
+        styles = getSampleStyleSheet()
+        story = []
 
-    # Título
-    title = Paragraph("Reporte de Clasificación de Enfermedades en Papas", styles['Title'])
-    story.append(title)
-    story.append(Spacer(1, 12))
+        # Title
+        title = Paragraph("Reporte de Clasificación de Enfermedades en Papas", styles['Title'])
+        story.append(title)
+        story.append(Spacer(1, 12))
 
-    # Tabla de resultados
-    data = [["Modelo", "Accuracy", "F1-Score", "ROC AUC"]]
-    for model_name, metrics in results.items():
-        data.append([
-            model_name,
-            f"{metrics['accuracy']:.4f}",
-            f"{metrics['f1']:.4f}",
-            f"{metrics['roc_auc']:.4f}"
-        ])
+        # Results table
+        data = [["Modelo", "Accuracy", "Precision", "Recall", "F1-Score", "ROC AUC"]]
+        for model_name, metrics in results.items():
+            data.append([
+                model_name,
+                f"{metrics['accuracy']:.4f}",
+                f"{metrics['precision']:.4f}",
+                f"{metrics['recall']:.4f}",
+                f"{metrics['f1']:.4f}",
+                f"{metrics['roc_auc']:.4f}"
+            ])
 
-    table = Table(data)
-    table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
-        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-        ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
-        ('GRID', (0, 0), (-1, -1), 1, colors.black)
-    ]))
-    story.append(table)
-    story.append(Spacer(1, 24))
+        table = Table(data)
+        table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black)
+        ]))
+        story.append(table)
+        story.append(Spacer(1, 24))
 
-    doc.build(story)
-    return filename
+        # Confusion matrix images
+        for model_name, metrics in results.items():
+            story.append(Paragraph(f"Matriz de Confusión - {model_name}", styles['Heading2']))
+            
+            y_pred = metrics['model'].predict(X_test, verbose=0)
+            y_pred_classes = np.argmax(y_pred, axis=1)
+            y_test_classes = np.argmax(y_test, axis=1)
+            
+            cm = confusion_matrix(y_test_classes, y_pred_classes)
+            plt.figure(figsize=(8, 6))
+            sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                        xticklabels=classes, yticklabels=classes)
+            plt.title(f'Matriz de Confusión - {model_name}')
+            plt.ylabel('Verdaderos')
+            plt.xlabel('Predichos')
+            cm_path = f"reports/cm_{model_name}.png"
+            plt.savefig(cm_path)
+            plt.close()
+            
+            story.append(ReportLabImage(cm_path, width=400, height=300))
+            story.append(Spacer(1, 12))
 
-# Cargar datos
+        doc.build(story)
+        return filename
+        
+    except Exception as e:
+        st.error(f"Error generando reporte: {str(e)}")
+        return None
+
+# Load data
 X_train, X_test, y_train, y_test, classes = load_data(dataset_path)
 
-# Estado de la sesión
+# Session state
 if 'models' not in st.session_state:
     st.session_state.models = None
 if 'results' not in st.session_state:
     st.session_state.results = None
 
-# Interfaz principal
+# Main interface
 if X_train is not None:
     st.subheader("📊 Estadísticas del Dataset")
     col1, col2 = st.columns(2)
@@ -293,9 +382,9 @@ if X_train is not None:
         plt.xticks(rotation=45)
         st.pyplot(fig)
 
-    # Botón de entrenamiento
-    if st.button("🚀 Entrenar Modelos"):
-        with st.spinner("Entrenando..."):
+    # Train button
+    if st.button("🚀 Entrenar Modelos", key="train_button"):
+        with st.spinner("Entrenando modelos..."):
             results, models, histories, training_times = train_models(
                 X_train, X_test, y_train, y_test, classes)
         
@@ -303,76 +392,125 @@ if X_train is not None:
             st.session_state.models = models
             st.session_state.results = results
             
-            st.subheader("📈 Resultados")
+            st.subheader("📈 Resultados del Entrenamiento")
+            
+            # Metrics table
             df_results = pd.DataFrame.from_dict({
                 model: {
                     'Accuracy': metrics['accuracy'],
                     'Precision': metrics['precision'],
                     'Recall': metrics['recall'],
-                    'F1': metrics['f1']
+                    'F1': metrics['f1'],
+                    'ROC AUC': metrics['roc_auc'],
+                    'Tiempo (s)': training_times.get(model, 'N/A')
                 }
                 for model, metrics in results.items()
             }, orient='index')
             
-            st.dataframe(df_results.style.format("{:.2%}"))
+            st.dataframe(df_results.style.format({
+                'Accuracy': '{:.2%}',
+                'Precision': '{:.2%}',
+                'Recall': '{:.2%}',
+                'F1': '{:.2%}',
+                'ROC AUC': '{:.2%}',
+                'Tiempo (s)': '{:.1f}'
+            }))
             
-            # Gráfico de comparación
-            fig, ax = plt.subplots(figsize=(10, 5))
-            df_results.plot(kind='bar', ax=ax)
-            ax.set_title("Comparación de Modelos")
+            # Model comparison chart
+            st.subheader("📊 Comparación de Modelos")
+            fig, ax = plt.subplots(figsize=(12, 6))
+            df_results[['Accuracy', 'Precision', 'Recall', 'F1']].plot(kind='bar', ax=ax)
+            ax.set_title("Comparación de Métricas por Modelo")
             ax.set_ylabel("Score")
+            ax.set_ylim(0, 1)
             plt.xticks(rotation=45)
             st.pyplot(fig)
             
-            # Generar reporte
-            report_path = generate_report(results, classes)
-            with open(report_path, "rb") as f:
-                st.download_button(
-                    "📥 Descargar Reporte",
-                    f,
-                    file_name="reporte_enfermedades_papa.pdf",
-                    mime="application/pdf"
-                )
+            # Training history plots
+            st.subheader("📉 Curvas de Aprendizaje")
+            for model_name, history in histories.items():
+                st.markdown(f"#### {model_name}")
+                
+                fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+                
+                # Accuracy plot
+                ax1.plot(history['accuracy'], label='Train Accuracy')
+                ax1.plot(history['val_accuracy'], label='Validation Accuracy')
+                ax1.set_title(f'{model_name} - Accuracy')
+                ax1.set_xlabel('Epoch')
+                ax1.set_ylabel('Accuracy')
+                ax1.legend()
+                
+                # Loss plot
+                ax2.plot(history['loss'], label='Train Loss')
+                ax2.plot(history['val_loss'], label='Validation Loss')
+                ax2.set_title(f'{model_name} - Loss')
+                ax2.set_xlabel('Epoch')
+                ax2.set_ylabel('Loss')
+                ax2.legend()
+                
+                st.pyplot(fig)
+            
+            # Generate and download report
+            st.subheader("📄 Generar Reporte")
+            if st.button("🖨️ Generar Reporte PDF"):
+                with st.spinner("Generando reporte..."):
+                    report_path = generate_report(results, classes)
+                    if report_path:
+                        with open(report_path, "rb") as f:
+                            st.download_button(
+                                "📥 Descargar Reporte Completo",
+                                f,
+                                file_name="reporte_enfermedades_papa.pdf",
+                                mime="application/pdf"
+                            )
 
-    # Sección de predicción
+    # Prediction section
     st.subheader("🔍 Clasificar Nueva Imagen")
-    uploaded_file = st.file_uploader("Sube una imagen de hoja de papa", type=["jpg", "jpeg", "png"])
+    uploaded_file = st.file_uploader("Sube una imagen de hoja de papa", type=["jpg", "jpeg", "png"], key="file_uploader")
     
-    if uploaded_file is not None and st.session_state.models:
-        image = Image.open(uploaded_file)
-        st.image(image, caption="Imagen subida", width=300)
-        
-        # Preprocesar
-        image = image.resize((224, 224))
-        img_array = np.array(image) / 255.0
-        img_array = np.expand_dims(img_array, axis=0)
-        
-        # Predicciones
-        predictions = {}
-        for model_name, model in st.session_state.models.items():
-            pred = model.predict(img_array)
-            predictions[model_name] = pred[0]
-        
-        # Mostrar resultados
-        st.subheader("📋 Diagnóstico")
-        cols = st.columns(len(predictions))
-        
-        for idx, (model_name, pred) in enumerate(predictions.items()):
-            with cols[idx]:
-                st.write(f"**{model_name}**")
-                prob_df = pd.DataFrame({
-                    'Clase': classes,
-                    'Probabilidad': pred
-                }).sort_values('Probabilidad', ascending=False)
+    if uploaded_file is not None:
+        try:
+            image = Image.open(uploaded_file)
+            st.image(image, caption="Imagen subida", width=300)
+            
+            # Preprocess
+            image = image.resize((224, 224))
+            img_array = np.array(image) / 255.0
+            img_array = np.expand_dims(img_array, axis=0)
+            
+            if st.session_state.models:
+                # Predictions
+                predictions = {}
+                for model_name, model in st.session_state.models.items():
+                    pred = model.predict(img_array, verbose=0)
+                    predictions[model_name] = pred[0]
                 
-                st.dataframe(prob_df.style.format({'Probabilidad': '{:.2%}'}))
+                # Show results
+                st.subheader("📋 Diagnóstico")
+                cols = st.columns(len(predictions))
                 
-                top_class = prob_df.iloc[0]
-                st.metric(
-                    label="Predicción",
-                    value=top_class['Clase'],
-                    delta=f"{top_class['Probabilidad']:.2%} confianza"
-                )
+                for idx, (model_name, pred) in enumerate(predictions.items()):
+                    with cols[idx]:
+                        st.markdown(f"**{model_name}**")
+                        prob_df = pd.DataFrame({
+                            'Clase': classes,
+                            'Probabilidad': pred
+                        }).sort_values('Probabilidad', ascending=False)
+                        
+                        st.dataframe(prob_df.style.format({'Probabilidad': '{:.2%}'}))
+                        
+                        top_class = prob_df.iloc[0]
+                        st.metric(
+                            label="Predicción",
+                            value=top_class['Clase'],
+                            delta=f"{top_class['Probabilidad']:.2%} confianza"
+                        )
+            else:
+                st.warning("Por favor entrena los modelos primero antes de hacer predicciones")
+                
+        except Exception as e:
+            st.error(f"Error procesando imagen: {str(e)}")
 
 # Footer
 st.markdown("---")
